@@ -1,6 +1,7 @@
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,6 +25,19 @@ struct program_args {
   struct in_addr remote_ip;
   /** Remote port which data is proxied to. */
   uint16_t remote_port;
+};
+
+/**
+ * Specifies a file descriptor to read and write from for operations against
+ * pairs of sockets.
+ */
+struct rw_socket_pair {
+  /** User friendly identifier to indicate which pair is in operation. */
+  const char* identifier;
+  /** Socket FD to read from. */
+  int read_fd;
+  /** Socket FD to wrtie to. */
+  int write_fd;
 };
 
 /**
@@ -154,10 +168,52 @@ void process_cmdline(int argc, char** argv, struct program_args* arg_ptr) {
   memcpy(arg_ptr, &parsed_args, sizeof(parsed_args));
 }
 
-int main(int argc, char** argv) {
-  struct program_args args = { 0 };
+/**
+ * Defines the data flow from one socket to another without handling
+ * transmission in the opposite direction.
+ *
+ * On success, returns NULL to be compatible with the `pthread` API. Exits the
+ * application on a read/write failure.
+ *
+ * @param socket_config a pair of sockets, one to read from and one to write to
+ * @returns NULL
+ */
+void* simplex_connection(void* socket_config) {
+  struct rw_socket_pair* config = (struct rw_socket_pair*)socket_config;
+  char transfer_buff[TRANSFER_BUFFER_SIZE];
 
+  // Communications loop
+  while (1) {
+    int bytes_in = read(config->read_fd, transfer_buff, TRANSFER_BUFFER_SIZE);
+
+    if (bytes_in < 0) {
+      perror("[ERORR] Failed to read bytes from socket");
+      exit(EXIT_FAILURE);
+    }
+
+    if (bytes_in == 0) {
+      printf(
+        "[INFO] Received EOF on simplex read (%s), ending affected half of proxy connection\n",
+        config->identifier
+      );
+
+      break;
+    }
+
+    int bytes_out = send(config->write_fd, transfer_buff, bytes_in, 0);
+
+    if (bytes_out == -1) {
+      perror("[ERROR] Failed to write bytes to socket");
+      exit(EXIT_FAILURE);
+    }
+  }
+
+  return NULL;
+}
+
+int main(int argc, char** argv) {
   // Argument parsing
+  struct program_args args = { 0 };
   process_cmdline(argc, argv, &args);
 
   // Log running process
@@ -243,37 +299,56 @@ int main(int argc, char** argv) {
   // Similar to the accepted log, ignore validation here as we know it is good
   // from the successful connect
   inet_ntop(AF_INET, &remote_address.sin_addr, friendly_ip, INET_ADDRSTRLEN);
-  printf("[INFO] Established remote connection to %s:%d\n", friendly_ip, ntohs(remote_address.sin_port));
 
-  int in_sock = accepted_sock;
-  int out_sock = remote_sock;
-  char transfer_buff[TRANSFER_BUFFER_SIZE];
+  printf(
+    "[INFO] Established remote connection to %s:%d\n",
+    friendly_ip,
+    ntohs(remote_address.sin_port)
+  );
 
-  // Communications loop
-  while (1) {
-    int bytes_in = read(in_sock, transfer_buff, TRANSFER_BUFFER_SIZE);
 
-    if (bytes_in < 0) {
-      perror("[ERORR] Failed to read bytes from socket");
+  // Define which FDs to read and write for each connection half
+  struct rw_socket_pair local_to_remote_pair = {
+    .identifier = "local",
+    .read_fd = accepted_sock,
+    .write_fd = remote_sock
+  };
+
+  struct rw_socket_pair remote_to_local_pair = {
+    .identifier = "remote",
+    .read_fd = remote_sock,
+    .write_fd = accepted_sock
+  };
+
+  // Establish threads for each half of the connection
+  pthread_t local_to_remote_simplex, remote_to_local_simplex;
+
+  if (pthread_create(
+      &local_to_remote_simplex,
+      NULL,
+      simplex_connection,
+      &local_to_remote_pair) != 0) {
+    perror("[ERROR] Unable to create local to remote thread");
+    exit(EXIT_FAILURE);
+  }
+
+  if (pthread_create(
+        &remote_to_local_simplex,
+        NULL,
+        simplex_connection,
+        &remote_to_local_pair) != 0) {
+    perror("[ERROR] Unable to create local to remote thread");
+    exit(EXIT_FAILURE);
+  }
+
+  // Wait on each side of the connection to close before we clean up our resources
+  const pthread_t join_threads[] = { local_to_remote_simplex, remote_to_local_simplex };
+
+  for (int i = 0; i < sizeof(join_threads) / sizeof(join_threads[0]); ++i) {
+    if (pthread_join(join_threads[i], NULL) != 0) {
+      perror("[ERROR] Encountered error while waiting on connection thread");
       exit(EXIT_FAILURE);
     }
-
-    if (bytes_in == 0) {
-      printf("[INFO] Received EOF on socket, ending proxy session\n");
-      break;
-    }
-
-    int bytes_out = send(out_sock, transfer_buff, bytes_in, 0);
-
-    if (bytes_out == -1) {
-      perror("[ERROR] Failed to write bytes to socket");
-      exit(EXIT_FAILURE);
-    }
-
-    // Swap our sockets to read/write from to handle other end of the stream
-    int temp_sock = out_sock;
-    out_sock = in_sock;
-    in_sock = temp_sock;
   }
 
   // Free resources
