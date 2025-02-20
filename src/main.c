@@ -71,8 +71,13 @@ int main(int argc, char** argv) {
 
   int sock_opt = 1;
 
-  if (setsockopt(source_sock, SOL_SOCKET, SO_REUSEPORT | SO_REUSEADDR, &sock_opt, sizeof(sock_opt)) == -1) {
-    perror("[ERROR] Unable to set appropiate options for the incoming socket");
+  if (setsockopt(source_sock, SOL_SOCKET, SO_REUSEPORT, &sock_opt, sizeof(sock_opt)) == -1) {
+    perror("[ERROR] Unable to set port reuse for the incoming socket");
+    exit(EXIT_FAILURE);
+  }
+
+  if (setsockopt(source_sock, SOL_SOCKET, SO_REUSEADDR, &sock_opt, sizeof(sock_opt)) == -1) {
+    perror("[ERROR] Unable to set address reuse for the incoming socket");
     exit(EXIT_FAILURE);
   }
 
