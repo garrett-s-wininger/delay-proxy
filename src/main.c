@@ -1,56 +1,148 @@
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <netinet/in.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #define LOOPBACK "127.0.0.1"
 #define TRANSFER_BUFFER_SIZE 1024
 
+/**
+ * Contains the arguments required for proper functioning of the application
+ * which are used to configure listening addresses and ports for the proxy.
+ */
+struct program_args {
+  /** IP on the locl machine which the proxy listens. */
+  struct in_addr local_ip;
+  /** Port on the local machine which the proxy listens. */
+  uint16_t local_port;
+  /** Remote IP which data is proxied to. */
+  struct in_addr remote_ip;
+  /** Remote port which data is proxied to. */
+  uint16_t remote_port;
+};
+
+/**
+ * Prints text to the terminal to indicate which operations are available to
+ * consumers of the software.
+ */
 void print_usage(void) {
   printf("Inject delays in network communications between two TCP endpoints\n\n");
   printf("Usage:\n");
   printf(" %-20s - Print this usage information\n", "proxy -h");
   printf(" %-20s - Run the proxy with the provided setings\n\n", "proxy OPTIONS");
   printf("Options:\n");
-  printf(" %-20s - Listen on the specified IPv4 address\n", "-l ADDRESS");
-  printf(" %-20s - Remote IPv4 address to proxy connection data to\n", "-r ADDRESS");
+  printf(" %-20s - Listen on the specified IPv4 address/port\n", "-l ADDRESS[:PORT]");
+  printf(" %-20s - Remote IPv4 address/port to proxy connection data to\n", "-r ADDRESS[:PORT]");
 }
 
-int main(int argc, char** argv) {
+/**
+ * Given an input string, parses out the IP address and port number,
+ * if provided and separated by a colon.
+ *
+ * On success, sets the provided address and port pointers to their parsed
+ * values. Port is only set if one is specified. Exits the program on invalid
+ * values as this operation needs to succeed in order to do any further proxy
+ * operations.
+ *
+ * @param input pointer to string for parsing in the format of ADDRESS[:PORT]
+ * @param address pointer to the address struct which will be set on success
+ * @param port pointer to the port data which will be set on a success
+ */
+void parse_ip_port_combo(const char* input, struct in_addr* address, uint16_t* port) {
+  // Copy the input to a mutable buffer to share implementation between the
+  // port and no-port address formats
+  size_t input_len = strlen(input);
+  char* address_str = strndup(input, input_len + 1);
+
+  // Start of port separator, if found
+  const char* result = NULL;
+
+  // We've found a port separator, parse it as appropriate
+  if ((result = strchr(address_str, ':')) != NULL) {
+    result += sizeof(char);
+    size_t result_len = strlen(result);
+
+    // Validate all values are numeric in the port portion of the input string
+    // to avoid a successful `atoi` parse that doesn't properly account for
+    // malformed data
+    for (int i = 0; i < result_len; ++i) {
+      if (!isdigit(result[i])) {
+        printf("[ERROR] Port %s is unparseable\n", result);
+        exit(EXIT_FAILURE);
+      }
+    }
+
+    int parsed_port = atoi(result);
+
+    // Ensure we're not using the placeholder or an invalid port value
+    if (parsed_port == 0 || parsed_port > UINT16_MAX) {
+      printf("[ERROR] Port %s is out of range, needed 1-65535\n", result);
+      exit(EXIT_FAILURE);
+    }
+
+    // Update the given port number
+    *port = (uint16_t)parsed_port;
+
+    // Update the colon to a null termination in order to limit how far the
+    // IP parsing proceeds
+    ptrdiff_t chars_to_separator = result - 1 - address_str;
+    address_str[chars_to_separator] = '\0';
+  }
+
+  // Parse the IP address
+  if (inet_pton(AF_INET, address_str, address) == 0) {
+    printf("[ERROR] IP %s is not a valid IPv4 address\n", optarg);
+    exit(EXIT_FAILURE);
+  }
+
+  // Free our duplicated string used during the parse attempt
+  free(address_str);
+}
+
+/**
+ * Parses single-character options from the command line in order to determine
+ * the proper IP/port configurations.
+ *
+ * Updates `arg_ptr` with the contents of the passed arguments on success.
+ * Exits gracefully when `-h` is provided to print this usage
+ * or fails the program when an invalid argument is encountered.
+ *
+ * @param argc standard C main function arg for count of arguments
+ * @param argv standard C main function argument vector
+ * @param arg_ptr destination to copy parsed arguments to
+ */
+void process_cmdline(int argc, char** argv, struct program_args* arg_ptr) {
+  // Storage for parsed arguments
+  struct program_args parsed_args = {
+    .local_ip = { 0 },
+    .local_port = 8081,
+    .remote_ip = { 0 },
+    .remote_port = 8080
+  };
+
+  // Default local/remote IPs, don't bother with validation
+  inet_pton(AF_INET, LOOPBACK, &parsed_args.local_ip);
+  inet_pton(AF_INET, LOOPBACK, &parsed_args.remote_ip);
+
+  // Loop variable storage
   int opt;
-  uint16_t local_port = 8081;
-  uint16_t remote_port = 8080;
 
-  // Don't bother with validation here on the known loopback address
-  struct in_addr local_ip, remote_ip = { 0 };
-  inet_pton(AF_INET, LOOPBACK, &local_ip);
-  inet_pton(AF_INET, LOOPBACK, &remote_ip);
-
-  char friendly_ip[INET_ADDRSTRLEN];
-
-  // Argument parsing
+  // Parsing loop
   while ((opt = getopt(argc, argv, "hl:r:")) != -1) {
     switch (opt) {
       case 'h':
         print_usage();
-        return 0;
+        exit(EXIT_SUCCESS);
       case 'l':
-        // TODO(Garrett): Handle attached port information
-        if (inet_pton(AF_INET, optarg, &local_ip) == 0) {
-          printf("[ERROR] Local IP %s is not a valid IPv4 address\n", optarg);
-          exit(EXIT_FAILURE);
-        }
-
+        parse_ip_port_combo(optarg, &parsed_args.local_ip, &parsed_args.local_port);
         break;
       case 'r':
-        // TODO(Garrett): Handle attached port information
-        if (inet_pton(AF_INET, optarg, &remote_ip) == 0) {
-          printf("[ERROR] Remote IP %s is not a valid IPv4 address\n", optarg);
-          exit(EXIT_FAILURE);
-        }
-
+        parse_ip_port_combo(optarg, &parsed_args.remote_ip, &parsed_args.remote_port);
         break;
       default:
         printf("\n");
@@ -59,6 +151,16 @@ int main(int argc, char** argv) {
     }
   }
 
+  memcpy(arg_ptr, &parsed_args, sizeof(parsed_args));
+}
+
+int main(int argc, char** argv) {
+  struct program_args args = { 0 };
+
+  // Argument parsing
+  process_cmdline(argc, argv, &args);
+
+  // Log running process
   printf("[INFO] Running as PID %d\n", getpid());
 
   // Create base of local listening socket
@@ -69,6 +171,7 @@ int main(int argc, char** argv) {
     exit(EXIT_FAILURE);
   }
 
+  // Set socket operations for proper address/port reuse
   int sock_opt = 1;
 
   if (setsockopt(source_sock, SOL_SOCKET, SO_REUSEPORT, &sock_opt, sizeof(sock_opt)) == -1) {
@@ -81,10 +184,11 @@ int main(int argc, char** argv) {
     exit(EXIT_FAILURE);
   }
 
+  // Prepare the local side of the proxy
   struct sockaddr_in address = {
-    .sin_addr = local_ip,
+    .sin_addr = args.local_ip,
     .sin_family = AF_INET,
-    .sin_port = htons(local_port)
+    .sin_port = htons(args.local_port)
   };
 
   if (bind(source_sock, (struct sockaddr*)&address, sizeof(address)) == -1) {
@@ -97,9 +201,11 @@ int main(int argc, char** argv) {
     exit(EXIT_FAILURE);
   }
 
-  inet_ntop(AF_INET, &local_ip, friendly_ip, INET_ADDRSTRLEN);
-  printf("[INFO] Listening for proxy connection on %s:%d\n", friendly_ip, local_port);
+  char friendly_ip[INET_ADDRSTRLEN];
+  inet_ntop(AF_INET, &args.local_ip, friendly_ip, INET_ADDRSTRLEN);
+  printf("[INFO] Listening for proxy connection on %s:%d\n", friendly_ip, args.local_port);
 
+  // Prepare storage for the client's connection information
   struct sockaddr_in client_address = {};
   socklen_t client_address_len = sizeof(client_address);
 
@@ -122,10 +228,11 @@ int main(int argc, char** argv) {
     exit(EXIT_FAILURE);
   }
 
+  // Configure remote end of the proxy
   struct sockaddr_in remote_address = {
-    .sin_addr = remote_ip,
+    .sin_addr = args.remote_ip,
     .sin_family = AF_INET,
-    .sin_port = htons(remote_port)
+    .sin_port = htons(args.remote_port)
   };
 
   if (connect(remote_sock, (struct sockaddr*)&remote_address, sizeof(remote_address)) == -1) {
@@ -133,7 +240,8 @@ int main(int argc, char** argv) {
     exit(EXIT_FAILURE);
   }
 
-  // Similar to the accepted log, ignore validation here as we know it is good from the successful connect
+  // Similar to the accepted log, ignore validation here as we know it is good
+  // from the successful connect
   inet_ntop(AF_INET, &remote_address.sin_addr, friendly_ip, INET_ADDRSTRLEN);
   printf("[INFO] Established remote connection to %s:%d\n", friendly_ip, ntohs(remote_address.sin_port));
 
@@ -168,6 +276,7 @@ int main(int argc, char** argv) {
     in_sock = temp_sock;
   }
 
+  // Free resources
   close(accepted_sock);
   close(remote_sock);
   close(source_sock);
