@@ -1,5 +1,6 @@
 #include <arpa/inet.h>
 #include <ctype.h>
+#include <errno.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stddef.h>
@@ -9,6 +10,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#define MILIS_TO_NANOS_MULTIPLIER 1000000
 #define LOOPBACK "127.0.0.1"
 #define TRANSFER_BUFFER_SIZE 1024
 
@@ -17,6 +19,8 @@
  * which are used to configure listening addresses and ports for the proxy.
  */
 struct program_args {
+  /** Duration to delay socket operations for. */
+  struct timespec delay_duration;
   /** IP on the locl machine which the proxy listens. */
   struct in_addr local_ip;
   /** Port on the local machine which the proxy listens. */
@@ -34,6 +38,8 @@ struct program_args {
 struct rw_socket_pair {
   /** User friendly identifier to indicate which pair is in operation. */
   const char* identifier;
+  /** Amount of delay to introduce into the read/write op. */
+  struct timespec delay_duration;
   /** Socket FD to read from. */
   int read_fd;
   /** Socket FD to wrtie to. */
@@ -47,9 +53,11 @@ struct rw_socket_pair {
 void print_usage(void) {
   printf("Inject delays in network communications between two TCP endpoints\n\n");
   printf("Usage:\n");
-  printf(" %-20s - Print this usage information\n", "proxy -h");
-  printf(" %-20s - Run the proxy with the provided setings\n\n", "proxy OPTIONS");
+  printf(" %-20s - Print this usage information\n", "delay-proxy -h");
+  printf(" %-20s - Run the proxy with default settings\n", "delay-proxy");
+  printf(" %-20s - Run the proxy with the provided setings\n\n", "delay-proxy OPTIONS");
   printf("Options:\n");
+  printf(" %-20s - Duration to delay socket operations, specified in ms\n", "-d DURATION");
   printf(" %-20s - Listen on the specified IPv4 address/port\n", "-l ADDRESS[:PORT]");
   printf(" %-20s - Remote IPv4 address/port to proxy connection data to\n", "-r ADDRESS[:PORT]");
 }
@@ -133,6 +141,7 @@ void parse_ip_port_combo(const char* input, struct in_addr* address, uint16_t* p
 void process_cmdline(int argc, char** argv, struct program_args* arg_ptr) {
   // Storage for parsed arguments
   struct program_args parsed_args = {
+    .delay_duration = { 0 },
     .local_ip = { 0 },
     .local_port = 8081,
     .remote_ip = { 0 },
@@ -145,13 +154,42 @@ void process_cmdline(int argc, char** argv, struct program_args* arg_ptr) {
 
   // Loop variable storage
   int opt;
+  size_t arg_len;
 
   // Parsing loop
-  while ((opt = getopt(argc, argv, "hl:r:")) != -1) {
+  while ((opt = getopt(argc, argv, "hd:l:r:")) != -1) {
     switch (opt) {
       case 'h':
         print_usage();
         exit(EXIT_SUCCESS);
+      case 'd':
+        arg_len = strlen(optarg);
+
+        // Ensure we have all numeric values to avoid truncation issues
+        for (int i = 0; i < arg_len; ++i) {
+          if (!isdigit(optarg[i])) {
+            printf("[ERROR] Received delay value of %s which is non-numeric\n", optarg);
+            exit(EXIT_FAILURE);
+          }
+        }
+
+        // Set our returned delay to be the provided number * milliseconds
+        long delay = atol(optarg);
+
+        // Keep us under a second to only fill a single portion of the associated struct
+        if (delay >= 1000) {
+          printf("[ERROR] Delay must be below a second, received %ld miliseconds\n", delay);
+          exit(EXIT_FAILURE);
+        }
+
+        // Update our return value to have the provided delay
+        struct timespec delay_spec = {
+          .tv_sec = 0,
+          .tv_nsec = delay * MILIS_TO_NANOS_MULTIPLIER
+        };
+
+        parsed_args.delay_duration = delay_spec;
+        break;
       case 'l':
         parse_ip_port_combo(optarg, &parsed_args.local_ip, &parsed_args.local_port);
         break;
@@ -184,11 +222,20 @@ void* simplex_connection(void* socket_config) {
 
   // Communications loop
   while (1) {
-    int bytes_in = read(config->read_fd, transfer_buff, TRANSFER_BUFFER_SIZE);
+    int bytes_in = recv(config->read_fd, transfer_buff, TRANSFER_BUFFER_SIZE, 0);
 
-    if (bytes_in < 0) {
-      perror("[ERORR] Failed to read bytes from socket");
-      exit(EXIT_FAILURE);
+    if (bytes_in == -1) {
+      if (errno == ECONNRESET) {
+        printf(
+          "[INFO] Read target reset (%s), ending affected half of proxy connection\n",
+          config->identifier
+        );
+
+        break;
+      } else {
+        perror("[ERROR] Failed to read bytes from socket");
+        exit(EXIT_FAILURE);
+      }
     }
 
     if (bytes_in == 0) {
@@ -200,11 +247,40 @@ void* simplex_connection(void* socket_config) {
       break;
     }
 
-    int bytes_out = send(config->write_fd, transfer_buff, bytes_in, 0);
+    // Only inject waits if we have requested it
+    if (config->delay_duration.tv_sec != 0 || config->delay_duration.tv_nsec != 0) {
+      struct timespec delay_remainder = { 0 };
+      struct timespec* delay_target = &config->delay_duration;
+      int sleep_result = 0;
 
-    if (bytes_out == -1) {
-      perror("[ERROR] Failed to write bytes to socket");
-      exit(EXIT_FAILURE);
+      // Continue re-sleeping until we have handled our entire value
+      do {
+        sleep_result = nanosleep(delay_target, &delay_remainder);
+
+        if (sleep_result == -1) {
+          // EINTR means a remainder to sleep for, otherwise an actual error occurred
+          if (errno == EINTR) {
+            delay_target = &delay_remainder;
+          } else {
+            perror("[ERROR] Unable to inject specified delay");
+            exit(EXIT_FAILURE);
+          }
+        }
+      } while (sleep_result != 0);
+    }
+
+    if (send(config->write_fd, transfer_buff, bytes_in, 0) == -1) {
+      if (errno == EPIPE) {
+        printf(
+          "[INFO] Write target (%s) closed, ending affected half of proxy connection\n",
+          config->identifier
+        );
+
+        break;
+      } else {
+        perror("[ERROR] Failed to write bytes to socket");
+        exit(EXIT_FAILURE);
+      }
     }
   }
 
@@ -218,6 +294,13 @@ int main(int argc, char** argv) {
 
   // Log running process
   printf("[INFO] Running as PID %d\n", getpid());
+
+  if (args.delay_duration.tv_sec != 0 || args.delay_duration.tv_nsec != 0) {
+    printf(
+      "[INFO] Running with %ld ms delay between read/write\n",
+      args.delay_duration.tv_nsec / MILIS_TO_NANOS_MULTIPLIER
+    );
+  }
 
   // Create base of local listening socket
   int source_sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -306,16 +389,17 @@ int main(int argc, char** argv) {
     ntohs(remote_address.sin_port)
   );
 
-
   // Define which FDs to read and write for each connection half
   struct rw_socket_pair local_to_remote_pair = {
     .identifier = "local",
+    .delay_duration = args.delay_duration,
     .read_fd = accepted_sock,
     .write_fd = remote_sock
   };
 
   struct rw_socket_pair remote_to_local_pair = {
     .identifier = "remote",
+    .delay_duration = args.delay_duration,
     .read_fd = remote_sock,
     .write_fd = accepted_sock
   };
