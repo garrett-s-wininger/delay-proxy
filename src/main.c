@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,8 +11,12 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#define MILIS_TO_NANOS_MULTIPLIER 1000000
+#define LOG_LEVEL_ERROR "ERROR"
+#define LOG_LEVEL_INFO "INFO"
 #define LOOPBACK "127.0.0.1"
+#define MAX_LOG_HEADER_SIZE 10
+#define MAX_LOG_SIZE 255
+#define MILIS_TO_NANOS_MULTIPLIER 1000000
 #define TRANSFER_BUFFER_SIZE 1024
 
 /**
@@ -63,6 +68,42 @@ void print_usage(void) {
 }
 
 /**
+ * Logs messages to STDERR in the format of "[LEVEL] TEXT\n".
+ *
+ * @param log_level level that the log message represents
+ * @param format format string of the log message body
+ * @param ... placeholder values for the specified format
+ */
+void log_message(const char* log_level, const char* format, ...) {
+  // Initial format of our header, this is our destination buffer so we need MAX_LOG_SIZE
+  char message[MAX_LOG_SIZE] = { 0 };
+  const int header_chars = snprintf(message, MAX_LOG_HEADER_SIZE, "[%s] ", log_level);
+
+  // Using variadic args, populate our provided format, up to MAX_LOG_SIZE
+  char message_text[MAX_LOG_SIZE] = { 0 };
+  va_list extra_args;
+  va_start(extra_args, format);
+  const int message_chars = vsnprintf(message_text, MAX_LOG_SIZE, format, extra_args);
+  va_end(extra_args);
+
+  // Identify how much space we have left, including the null terminator and newline
+  const int remaining_space = MAX_LOG_SIZE - header_chars - message_chars - 2;
+
+  // Error out if we're going to overflow
+  if (remaining_space < 0) {
+    fprintf(stderr, "[ERROR] Not enough buffer space for requested formatting\n");
+    exit(EXIT_FAILURE);
+  }
+
+  // Concat the header, message, and newline
+  strncat(message, message_text, remaining_space);
+  strncat(message, "\n", 1);
+
+  // Output the log
+  fputs(message, stderr);
+}
+
+/**
  * Given an input string, parses out the IP address and port number,
  * if provided and separated by a colon.
  *
@@ -94,7 +135,7 @@ void parse_ip_port_combo(const char* input, struct in_addr* address, uint16_t* p
     // malformed data
     for (int i = 0; i < result_len; ++i) {
       if (!isdigit(result[i])) {
-        printf("[ERROR] Port %s is unparseable\n", result);
+        log_message(LOG_LEVEL_ERROR, "Port %s is unparseable", result);
         exit(EXIT_FAILURE);
       }
     }
@@ -103,7 +144,7 @@ void parse_ip_port_combo(const char* input, struct in_addr* address, uint16_t* p
 
     // Ensure we're not using the placeholder or an invalid port value
     if (parsed_port == 0 || parsed_port > UINT16_MAX) {
-      printf("[ERROR] Port %s is out of range, needed 1-65535\n", result);
+      log_message(LOG_LEVEL_ERROR, "Port %s is out of range, needed 1-65535", result);
       exit(EXIT_FAILURE);
     }
 
@@ -118,7 +159,7 @@ void parse_ip_port_combo(const char* input, struct in_addr* address, uint16_t* p
 
   // Parse the IP address
   if (inet_pton(AF_INET, address_str, address) == 0) {
-    printf("[ERROR] IP %s is not a valid IPv4 address\n", optarg);
+    log_message(LOG_LEVEL_ERROR, "IP %s is not a valid IPv4 address", optarg);
     exit(EXIT_FAILURE);
   }
 
@@ -168,7 +209,12 @@ void process_cmdline(int argc, char** argv, struct program_args* arg_ptr) {
         // Ensure we have all numeric values to avoid truncation issues
         for (int i = 0; i < arg_len; ++i) {
           if (!isdigit(optarg[i])) {
-            printf("[ERROR] Received delay value of %s which is non-numeric\n", optarg);
+            log_message(
+              LOG_LEVEL_ERROR,
+              "Received delay value of %s which is non-numeric",
+              optarg
+            );
+
             exit(EXIT_FAILURE);
           }
         }
@@ -178,7 +224,12 @@ void process_cmdline(int argc, char** argv, struct program_args* arg_ptr) {
 
         // Keep us under a second to only fill a single portion of the associated struct
         if (delay >= 1000) {
-          printf("[ERROR] Delay must be below a second, received %ld miliseconds\n", delay);
+          log_message(
+            LOG_LEVEL_ERROR,
+            "Delay must be below a second, received %ld miliseconds",
+            delay
+          );
+
           exit(EXIT_FAILURE);
         }
 
@@ -226,8 +277,9 @@ void* simplex_connection(void* socket_config) {
 
     if (bytes_in == -1) {
       if (errno == ECONNRESET) {
-        printf(
-          "[INFO] Read target reset (%s), ending affected half of proxy connection\n",
+        log_message(
+          LOG_LEVEL_INFO,
+          "Read target reset (%s), ending affected half of proxy connection",
           config->identifier
         );
 
@@ -239,8 +291,9 @@ void* simplex_connection(void* socket_config) {
     }
 
     if (bytes_in == 0) {
-      printf(
-        "[INFO] Received EOF on simplex read (%s), ending affected half of proxy connection\n",
+      log_message(
+        LOG_LEVEL_INFO,
+        "Received EOF on simplex read (%s), ending affected half of proxy connection\n",
         config->identifier
       );
 
@@ -271,8 +324,9 @@ void* simplex_connection(void* socket_config) {
 
     if (send(config->write_fd, transfer_buff, bytes_in, 0) == -1) {
       if (errno == EPIPE) {
-        printf(
-          "[INFO] Write target (%s) closed, ending affected half of proxy connection\n",
+        log_message(
+          LOG_LEVEL_INFO,
+          "Write target (%s) closed, ending affected half of proxy connection",
           config->identifier
         );
 
@@ -293,11 +347,12 @@ int main(int argc, char** argv) {
   process_cmdline(argc, argv, &args);
 
   // Log running process
-  printf("[INFO] Running as PID %d\n", getpid());
+  log_message(LOG_LEVEL_INFO, "Running as PID %d", getpid());
 
   if (args.delay_duration.tv_sec != 0 || args.delay_duration.tv_nsec != 0) {
-    printf(
-      "[INFO] Running with %ld ms delay between read/write\n",
+    log_message(
+      LOG_LEVEL_INFO,
+      "Running with %ld ms delay between read/write",
       args.delay_duration.tv_nsec / MILIS_TO_NANOS_MULTIPLIER
     );
   }
@@ -342,7 +397,13 @@ int main(int argc, char** argv) {
 
   char friendly_ip[INET_ADDRSTRLEN];
   inet_ntop(AF_INET, &args.local_ip, friendly_ip, INET_ADDRSTRLEN);
-  printf("[INFO] Listening for proxy connection on %s:%d\n", friendly_ip, args.local_port);
+
+  log_message(
+    LOG_LEVEL_INFO,
+    "Listening for proxy connection on %s:%d",
+    friendly_ip,
+    args.local_port
+  );
 
   // Prepare storage for the client's connection information
   struct sockaddr_in client_address = {};
@@ -357,7 +418,13 @@ int main(int argc, char** argv) {
 
   // Presume accept gave us a properly formatted address, skip validation
   inet_ntop(AF_INET, &client_address.sin_addr, friendly_ip, INET_ADDRSTRLEN);
-  printf("[INFO] Accepted connection from %s:%d\n", friendly_ip, ntohs(client_address.sin_port));
+
+  log_message(
+    LOG_LEVEL_INFO,
+    "Accepted connection from %s:%d",
+    friendly_ip,
+    ntohs(client_address.sin_port)
+  );
 
   // Create socket for remote end of the proxy
   int remote_sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -383,8 +450,9 @@ int main(int argc, char** argv) {
   // from the successful connect
   inet_ntop(AF_INET, &remote_address.sin_addr, friendly_ip, INET_ADDRSTRLEN);
 
-  printf(
-    "[INFO] Established remote connection to %s:%d\n",
+  log_message(
+    LOG_LEVEL_INFO,
+    "Established remote connection to %s:%d",
     friendly_ip,
     ntohs(remote_address.sin_port)
   );
